@@ -1,75 +1,55 @@
 from __future__ import annotations
+from typing import Dict
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import asyncio
+from app.extractor import extract_info
 
-from typing import Dict, List, Optional, Union
-
-from fastapi import Depends, FastAPI
-from sqlalchemy.orm import Session
-
-from app import crud
-from app.database import Base, engine, get_db
-from app.extractor import extract_bookmark_data
-from app.schemas import BookmarkCreateRequest, BookmarkResponse
-from app.scraper import fetch_page_content
-
-
-# APIアプリ本体です。
 app = FastAPI(
-    title="SNS商品紹介URL 自動仕分けAPI",
-    description="共有されたSNS URLを解析し、店舗別・発信アカウント別に保存します。",
-    version="0.1.0",
+    title="SNS買い物リスト API",
+    description="SNS投稿URLを解析して店舗・商品情報を返すAPI",
+    version="0.2.0",
 )
 
+# フロントエンド（Netlify）からのアクセスを許可
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-@app.on_event("startup")
-def on_startup() -> None:
-    """アプリ起動時に、必要なデータベーステーブルを作成します。"""
-    Base.metadata.create_all(bind=engine)
-
+class BookmarkRequest(BaseModel):
+    url: str
+    hint_text: str = ""  # ユーザーが貼り付けた投稿テキスト（任意）
 
 @app.get("/health")
-def health_check() -> dict[str, str]:
-    """アプリが起動しているか確認するための簡単なAPIです。"""
+def health_check():
     return {"status": "ok"}
 
-
-@app.post("/bookmarks", response_model=BookmarkResponse)
-def create_bookmark(
-    request: BookmarkCreateRequest,
-    db: Session = Depends(get_db),
-) -> BookmarkResponse:
-    """URLを受け取り、解析してデータベースへ保存します。"""
-    original_url = str(request.url)
-    page_content = fetch_page_content(original_url)
-    source_text = page_content.to_text()
-    extracted = extract_bookmark_data(original_url=original_url, source_text=source_text)
-    bookmark = crud.create_bookmark(db=db, data=extracted, source_text=source_text)
-    return BookmarkResponse.model_validate(bookmark)
-
-
-@app.get("/bookmarks", response_model=list[BookmarkResponse])
-def list_bookmarks(
-    store_name: Optional[str] = None,
-    post_account: Optional[str] = None,
-    category: Optional[str] = None,
-    db: Session = Depends(get_db),
-) -> List[BookmarkResponse]:
-    """保存済み投稿を、店舗名・発信アカウント名・カテゴリで絞り込みます。"""
-    bookmarks = crud.list_bookmarks(
-        db=db,
-        store_name=store_name,
-        post_account=post_account,
-        category=category,
-    )
-    return [BookmarkResponse.model_validate(bookmark) for bookmark in bookmarks]
-
+@app.post("/bookmarks")
+async def create_bookmark(request: BookmarkRequest):
+    """URLを受け取り、店舗・商品名・カテゴリを解析して返す"""
+    result = await extract_info(request.url)
+    
+    # hint_textが渡された場合はそちらも使って再判別
+    if request.hint_text:
+        from app.extractor import detect_store, detect_category, extract_product_name
+        combined = f"{result.get('product_name','')} {request.hint_text}".lower()
+        store = detect_store(combined, request.url)
+        if store != "その他":
+            result["store_name"] = store
+        result["category"] = detect_category(combined)
+        if len(request.hint_text) > 5:
+            result["product_name"] = extract_product_name(
+                request.hint_text, request.hint_text, result["store_name"]
+            )
+    
+    return result
 
 @app.get("/stores")
-def list_stores(db: Session = Depends(get_db)) -> List[Dict[str, Union[int, str]]]:
-    """店舗ごとの保存件数を返します。"""
-    return crud.list_store_summary(db)
-
-
-@app.get("/accounts")
-def list_accounts(db: Session = Depends(get_db)) -> List[Dict[str, Union[int, str]]]:
-    """発信アカウントごとの保存件数を返します。"""
-    return crud.list_account_summary(db)
+async def get_stores():
+    """対応店舗一覧を返す"""
+    from app.extractor import STORE_KEYWORDS
+    return {"stores": list(STORE_KEYWORDS.keys())}
