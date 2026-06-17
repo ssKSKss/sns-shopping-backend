@@ -1,182 +1,226 @@
-from __future__ import annotations
+"""
+extractor.py
+OpenAI APIなしでも高精度に店舗・商品情報を抽出するモジュール。
+InstagramのURLからOGPメタデータを取得し、キーワードマッチで判別する。
+"""
 
-import json
-import os
 import re
-from typing import Any
+import httpx
+from bs4 import BeautifulSoup
 
-from openai import OpenAI
-
-from app.schemas import ExtractedBookmark
-
-
-# 自動仕分け対象の店舗名を、表記ゆれも含めて定義します。
-STORE_ALIASES = {
-    "DAISO": ["daiso", "ダイソー", "大創産業"],
-    "Seria": ["seria", "セリア"],
-    "CanDo": ["cando", "can do", "キャンドゥ"],
-    "3COINS": ["3coins", "3 coins", "スリーコインズ", "スリコ"],
-    "Standard Products": ["standard products", "スタンダードプロダクツ"],
-    "ニトリ": ["ニトリ", "nitori"],
-    "デコホーム": ["デコホーム", "deco home"],
-    "IKEA": ["ikea", "イケア"],
+# ── 店舗キーワード辞書（多ければ多いほど精度UP）──
+STORE_KEYWORDS = {
+    "DAISO": [
+        "daiso", "ダイソー", "だいそー", "DAISO", "大創",
+        "100均", "100円ショップ", "百均", "ひゃっきん",
+        "#daiso", "#ダイソー", "#100均"
+    ],
+    "Seria": [
+        "seria", "セリア", "#seria", "#セリア",
+        "100均", "百均"
+    ],
+    "CanDo": [
+        "cando", "can★do", "キャンドゥ", "キャンドゥー",
+        "#cando", "#キャンドゥ", "100均", "百均"
+    ],
+    "3COINS": [
+        "3coins", "3コインズ", "スリーコインズ", "3COINS",
+        "#3coins", "#3コインズ", "#スリーコインズ"
+    ],
+    "Standard Products": [
+        "standard products", "スタンダードプロダクツ",
+        "#standardproducts", "#スタンダードプロダクツ"
+    ],
+    "無印良品": [
+        "muji", "無印良品", "無印", "MUJI",
+        "#muji", "#無印良品", "#無印"
+    ],
+    "ニトリ": [
+        "nitori", "ニトリ", "デコホーム", "decohome",
+        "#nitori", "#ニトリ", "#デコホーム"
+    ],
+    "IKEA": [
+        "ikea", "イケア", "IKEA",
+        "#ikea", "#イケア"
+    ],
+    "ワークマン": [
+        "workman", "ワークマン", "workman plus",
+        "#workman", "#ワークマン", "#ワークマン女子"
+    ],
 }
 
-
-# カテゴリ判定に使うキーワードです。
+# ── カテゴリキーワード辞書 ──
 CATEGORY_KEYWORDS = {
-    "キッチン": ["キッチン", "調理", "食器", "皿", "保存容器", "まな板", "包丁"],
-    "収納": ["収納", "ボックス", "ケース", "棚", "ラック", "整理"],
-    "掃除": ["掃除", "クリーナー", "ほこり", "洗剤", "ブラシ", "スポンジ"],
-    "インテリア": ["インテリア", "家具", "照明", "カーテン", "ラグ", "ソファ"],
-    "バス・トイレ": ["バス", "風呂", "トイレ", "洗面", "タオル"],
-    "文房具": ["文房具", "ノート", "ペン", "手帳"],
+    "収納": ["収納", "ボックス", "ケース", "仕切り", "整理", "棚", "シェルフ", "ラック", "カゴ", "バスケット"],
+    "キッチン": ["キッチン", "料理", "調理", "まな板", "フライパン", "鍋", "食器", "タッパー", "弁当", "お弁当", "食洗機"],
+    "インテリア": ["インテリア", "部屋", "リビング", "ルーム", "ディスプレイ", "飾り", "アロマ", "照明", "クッション", "ラグ"],
+    "掃除": ["掃除", "クリーナー", "モップ", "雑巾", "洗剤", "スポンジ", "ブラシ", "汚れ", "きれい"],
+    "洗面・バス": ["バス", "洗面", "お風呂", "シャンプー", "洗顔", "タオル", "歯ブラシ"],
+    "寝具": ["寝具", "布団", "枕", "ベッド", "マットレス", "毛布", "シーツ", "パッド"],
+    "ファッション": ["ファッション", "服", "コーデ", "着こなし", "アウター", "トップス", "パンツ", "靴", "バッグ"],
+    "ホビー": ["ハンドメイド", "DIY", "デコ", "アクセサリー", "手芸", "クラフト", "ネイル"],
+    "生活雑貨": ["雑貨", "日用品", "生活", "便利", "グッズ", "アイテム"],
 }
 
+# 実店舗確認が必要な店舗
+LOCATION_REQUIRED_STORES = {"ニトリ", "IKEA", "ワークマン"}
 
-def extract_bookmark_data(original_url: str, source_text: str) -> ExtractedBookmark:
-    """OpenAI APIを優先して、投稿テキストから保存項目を抽出します。"""
-    if os.getenv("OPENAI_API_KEY"):
-        return _extract_with_openai(original_url=original_url, source_text=source_text)
+# ── OGPメタデータ取得 ──
+async def fetch_ogp(url: str) -> dict:
+    """
+    URLにアクセスしてOGP（Open Graph Protocol）のメタデータを取得する。
+    title, description, site_name などが取れる。
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+        )
+    }
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
+            res = await client.get(url, headers=headers)
+            res.raise_for_status()
+            soup = BeautifulSoup(res.text, "html.parser")
 
-    # APIキーがない開発環境では、最低限のルールベース抽出に切り替えます。
-    return _extract_with_rules(original_url=original_url, source_text=source_text)
+            def og(prop):
+                tag = soup.find("meta", property=f"og:{prop}")
+                if tag:
+                    return tag.get("content", "")
+                tag = soup.find("meta", attrs={"name": f"og:{prop}"})
+                return tag.get("content", "") if tag else ""
 
+            title       = og("title") or soup.title.string if soup.title else ""
+            description = og("description")
+            site_name   = og("site_name")
 
-def _extract_with_openai(original_url: str, source_text: str) -> ExtractedBookmark:
-    """OpenAI APIへ依頼し、必ずJSONとして抽出結果を受け取ります。"""
-    client = OpenAI()
+            # titleからInstagramの余分なテキストを除去
+            title = re.sub(r'\s*[-|]\s*Instagram.*$', '', title or '', flags=re.IGNORECASE)
+            title = re.sub(r'\s*[-|]\s*TikTok.*$',   '', title or '', flags=re.IGNORECASE)
 
-    prompt = f"""
-あなたはSNSの商品紹介投稿を整理するアシスタントです。
-以下のURLと取得テキストから、指定スキーマのJSONだけを返してください。
-
-対象店舗:
-- DAISO
-- Seria
-- CanDo
-- 3COINS
-- Standard Products
-- ニトリ
-- デコホーム
-- IKEA
-- その他
-
-ルール:
-- store_nameは対象店舗に一致しない場合「その他」にしてください。
-- product_nameが特定できない場合は「商品紹介投稿」にしてください。
-- post_accountが不明な場合は「不明」にしてください。
-- categoryは「キッチン」「収納」「掃除」「インテリア」「バス・トイレ」「文房具」「その他」のどれかに寄せてください。
-- location_requiredは、IKEAやニトリなど大型家具・実物確認が重要そうな商品ならtrue、それ以外は基本falseにしてください。
-
-URL:
-{original_url}
-
-取得テキスト:
-{source_text[:6000]}
-""".strip()
-
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "返答はJSONのみ。説明文やMarkdownは不要です。"},
-            {"role": "user", "content": prompt},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.1,
-    )
-
-    raw_content = response.choices[0].message.content or "{}"
-    parsed = json.loads(raw_content)
-    normalized = _normalize_extracted_data(parsed, original_url)
-    return ExtractedBookmark(**normalized)
+            return {
+                "title":       (title or "").strip(),
+                "description": (description or "").strip(),
+                "site_name":   (site_name or "").strip(),
+                "full_text":   f"{title} {description}".lower(),
+            }
+    except Exception as e:
+        print(f"OGP取得失敗: {e}")
+        return {"title": "", "description": "", "site_name": "", "full_text": ""}
 
 
-def _extract_with_rules(original_url: str, source_text: str) -> ExtractedBookmark:
-    """OpenAI APIキーがない場合の簡易的な抽出処理です。"""
-    text = f"{original_url}\n{source_text}"
+# ── 店舗名判別 ──
+def detect_store(text: str, url: str) -> str:
+    """
+    テキストとURLからキーワードマッチで店舗名を判別する。
+    """
+    text_lower = text.lower()
+    url_lower  = url.lower()
 
-    store_name = _detect_store_name(text)
-    category = _detect_category(text)
-    post_account = _detect_account(original_url, source_text)
-    product_name = _detect_product_name(source_text, store_name)
-    location_required = _detect_location_required(store_name, text)
+    for store, keywords in STORE_KEYWORDS.items():
+        for kw in keywords:
+            if kw.lower() in text_lower or kw.lower() in url_lower:
+                return store
 
-    return ExtractedBookmark(
-        store_name=store_name,
-        product_name=product_name,
-        post_account=post_account,
-        original_url=original_url,
-        category=category,
-        location_required=location_required,
-    )
+    return "その他"
 
 
-def _normalize_extracted_data(data: dict[str, Any], original_url: str) -> dict[str, Any]:
-    """AIの返答に不足や表記ゆれがあっても、DBに保存できる形へ整えます。"""
-    store_name = str(data.get("store_name") or "その他").strip()
-    if store_name not in STORE_ALIASES and store_name != "その他":
-        store_name = _detect_store_name(store_name)
+# ── カテゴリ判別 ──
+def detect_category(text: str) -> str:
+    """
+    テキストからカテゴリを判別する。
+    """
+    for category, keywords in CATEGORY_KEYWORDS.items():
+        for kw in keywords:
+            if kw in text:
+                return category
+    return "生活雑貨"
+
+
+# ── 商品名抽出 ──
+def extract_product_name(title: str, description: str, store: str) -> str:
+    """
+    OGPのtitleとdescriptionから商品名らしき文字列を抽出する。
+    """
+    # Instagramの定型文を除去
+    clean_patterns = [
+        r'[\d,]+\s*[いイ]いね',
+        r'[\d,]+\s*件のコメント',
+        r'この投稿をInstagramで見る',
+        r'さんがシェアした投稿',
+        r'\d+\s*likes?',
+        r'\d+\s*comments?',
+    ]
+    text = description or title or ""
+    for pat in clean_patterns:
+        text = re.sub(pat, '', text, flags=re.IGNORECASE)
+
+    # 最初の50文字を商品名として使う（長すぎる場合は切る）
+    text = text.strip()
+    if len(text) > 50:
+        # 句読点・改行で区切って最初のフレーズを取る
+        for sep in ['。', '！', '!', '、', '\n', '#']:
+            if sep in text:
+                text = text.split(sep)[0].strip()
+                break
+        if len(text) > 50:
+            text = text[:47] + "..."
+
+    if not text or len(text) < 2:
+        return f"{store}紹介投稿"
+
+    return text
+
+
+# ── アカウント名抽出 ──
+def extract_account(url: str, description: str) -> str:
+    """
+    URLまたはdescriptionからSNSアカウント名を抽出する。
+    """
+    # Instagram URLから @username を抽出
+    ig_match = re.search(r'instagram\.com/([^/?]+)', url)
+    if ig_match:
+        username = ig_match.group(1)
+        if username not in ('p', 'reel', 'stories', 'tv'):
+            return f"@{username}"
+
+    # TikTok URLから @username を抽出
+    tt_match = re.search(r'tiktok\.com/@([^/?]+)', url)
+    if tt_match:
+        return f"@{tt_match.group(1)}"
+
+    # descriptionから「@xxx さんがシェア」パターン
+    desc_match = re.search(r'@([\w.]+)', description or '')
+    if desc_match:
+        return f"@{desc_match.group(1)}"
+
+    return "@unknown"
+
+
+# ── メイン抽出関数（app/main.py から呼ばれる）──
+async def extract_info(url: str) -> dict:
+    """
+    URLから店舗・商品名・カテゴリなどの情報を抽出して返す。
+    OpenAI APIは使わずキーワードマッチのみで判別する。
+    """
+    # OGPメタデータ取得
+    ogp = await fetch_ogp(url)
+
+    full_text    = ogp["full_text"]
+    title        = ogp["title"]
+    description  = ogp["description"]
+
+    # 各項目を判別
+    store_name   = detect_store(full_text, url)
+    category     = detect_category(full_text)
+    product_name = extract_product_name(title, description, store_name)
+    post_account = extract_account(url, description)
+    location_required = store_name in LOCATION_REQUIRED_STORES
 
     return {
-        "store_name": store_name or "その他",
-        "product_name": str(data.get("product_name") or "商品紹介投稿").strip(),
-        "post_account": str(data.get("post_account") or "不明").strip(),
-        "original_url": str(data.get("original_url") or original_url).strip(),
-        "category": str(data.get("category") or "その他").strip(),
-        "location_required": bool(data.get("location_required", False)),
+        "store_name":        store_name,
+        "product_name":      product_name,
+        "post_account":      post_account,
+        "category":          category,
+        "location_required": location_required,
+        "original_url":      url,
     }
-
-
-def _detect_store_name(text: str) -> str:
-    """文章内のキーワードから店舗名を判定します。"""
-    lower_text = text.lower()
-    for store_name, aliases in STORE_ALIASES.items():
-        if any(alias.lower() in lower_text for alias in aliases):
-            return store_name
-    return "その他"
-
-
-def _detect_category(text: str) -> str:
-    """文章内のキーワードからカテゴリを判定します。"""
-    for category, keywords in CATEGORY_KEYWORDS.items():
-        if any(keyword in text for keyword in keywords):
-            return category
-    return "その他"
-
-
-def _detect_account(original_url: str, source_text: str) -> str:
-    """URLやメタテキストから発信アカウントらしい名前を取り出します。"""
-    instagram_match = re.search(r"instagram\.com/([^/?#]+)/", original_url)
-    if instagram_match and instagram_match.group(1) not in {"p", "reel", "reels"}:
-        return instagram_match.group(1)
-
-    tiktok_match = re.search(r"tiktok\.com/@([^/?#]+)", original_url)
-    if tiktok_match:
-        return f"@{tiktok_match.group(1)}"
-
-    account_match = re.search(r"@([A-Za-z0-9_.-]{2,50})", source_text)
-    if account_match:
-        return f"@{account_match.group(1)}"
-
-    return "不明"
-
-
-def _detect_product_name(source_text: str, store_name: str) -> str:
-    """ページタイトルなどから、商品名らしい短い文字列を作ります。"""
-    for line in source_text.splitlines():
-        cleaned = line.replace("Title:", "").replace("Description:", "").strip()
-        if 3 <= len(cleaned) <= 80 and "URL:" not in cleaned:
-            return cleaned
-
-    if store_name != "その他":
-        return f"{store_name}紹介投稿"
-    return "商品紹介投稿"
-
-
-def _detect_location_required(store_name: str, text: str) -> bool:
-    """店舗確認が必要そうかどうかをざっくり判定します。"""
-    large_item_words = ["家具", "ソファ", "ベッド", "棚", "大型", "組み立て", "展示"]
-    if store_name in {"IKEA", "ニトリ", "デコホーム"} and any(word in text for word in large_item_words):
-        return True
-    return False
