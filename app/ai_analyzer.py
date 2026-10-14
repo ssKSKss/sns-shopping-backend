@@ -132,8 +132,9 @@ def analyze_post(
     url: str = "",
 ) -> dict:
     """画像とキャプションをClaudeに渡して、店舗・商品を判定します。"""
-    # キーに使われるのは英数字と - _ だけ。コピー時に混ざりがちな空白・改行などを取り除く
-    api_key = re.sub(r"[^A-Za-z0-9_\-]", "", os.getenv("ANTHROPIC_API_KEY") or "")
+    # コピー時に混ざりがちな空白・改行・全角文字など、通信に使えない文字だけを取り除く
+    # （半角の記号は、キーの形式が変わっても壊さないよう残す）
+    api_key = re.sub(r"[^\x21-\x7E]", "", os.getenv("ANTHROPIC_API_KEY") or "")
     if not api_key:
         return _fallback(caption, url)
 
