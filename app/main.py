@@ -1,10 +1,11 @@
 from __future__ import annotations
-from typing import Dict
-from fastapi import FastAPI
+from typing import Dict, Optional
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import asyncio
 from app.extractor import extract_info
+from app.ai_analyzer import ALLOWED_IMAGE_TYPES, analyze_post
 
 app = FastAPI(
     title="SNS買い物リスト API",
@@ -47,6 +48,35 @@ async def create_bookmark(request: BookmarkRequest):
             )
     
     return result
+
+MAX_IMAGE_BYTES = 5 * 1024 * 1024  # 5MBまで
+
+
+@app.post("/analyze")
+async def analyze(
+    image: Optional[UploadFile] = File(None, description="投稿のスクリーンショット（任意）"),
+    caption: str = Form("", description="投稿のキャプション文（任意）"),
+    url: str = Form("", description="投稿のURL（任意）"),
+):
+    """スクショ画像・キャプションをAIに見せて、店舗・商品を判定する"""
+    image_bytes = None
+    image_type = None
+    if image is not None and image.filename:
+        image_type = image.content_type
+        if image_type not in ALLOWED_IMAGE_TYPES:
+            raise HTTPException(400, "画像は JPEG / PNG / WebP / GIF で送ってください")
+        image_bytes = await image.read()
+        if len(image_bytes) > MAX_IMAGE_BYTES:
+            raise HTTPException(400, "画像が大きすぎます（5MBまで）")
+
+    if not image_bytes and not caption.strip():
+        raise HTTPException(400, "画像かキャプションのどちらかを送ってください")
+
+    # Claude APIの呼び出しは時間がかかるので別スレッドで実行
+    return await asyncio.to_thread(
+        analyze_post, image_bytes, image_type, caption, url
+    )
+
 
 @app.get("/stores")
 async def get_stores():
