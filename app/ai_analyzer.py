@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 from typing import Optional
 
 from app.extractor import (
@@ -131,8 +132,8 @@ def analyze_post(
     url: str = "",
 ) -> dict:
     """画像とキャプションをClaudeに渡して、店舗・商品を判定します。"""
-    # コピー時に混ざりがちな前後の空白・改行を取り除く
-    api_key = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
+    # キーに使われるのは英数字と - _ だけ。コピー時に混ざりがちな空白・改行などを取り除く
+    api_key = re.sub(r"[^A-Za-z0-9_\-]", "", os.getenv("ANTHROPIC_API_KEY") or "")
     if not api_key:
         return _fallback(caption, url)
 
