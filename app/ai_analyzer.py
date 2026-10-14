@@ -131,7 +131,8 @@ def analyze_post(
     url: str = "",
 ) -> dict:
     """画像とキャプションをClaudeに渡して、店舗・商品を判定します。"""
-    api_key = os.getenv("ANTHROPIC_API_KEY")
+    # コピー時に混ざりがちな前後の空白・改行を取り除く
+    api_key = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
     if not api_key:
         return _fallback(caption, url)
 
@@ -166,9 +167,15 @@ def analyze_post(
             messages=[{"role": "user", "content": content}],
         )
     except Exception as e:  # 通信エラーや残高切れなど
-        print(f"Claude API呼び出し失敗: {e}")
+        # 注意: 例外の本文にはAPIキーが含まれる場合があるため、種類の名前だけを記録する
+        cause = e.__cause__
+        cause_name = type(cause).__name__ if cause else ""
+        label = type(e).__name__ + (f" ({cause_name})" if cause_name else "")
+        if isinstance(e, anthropic.APIStatusError):
+            label += f" status={e.status_code}"
+        print(f"Claude API呼び出し失敗: {label}")
         result = _fallback(caption, url)
-        result["error"] = str(e)
+        result["error"] = label
         return result
 
     data = next(
