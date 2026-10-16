@@ -188,6 +188,11 @@ def extract_account(url: str, description: str) -> str:
     if tt_match:
         return f"@{tt_match.group(1)}"
 
+    # X(Twitter) URLから @username を抽出（/status/... の投稿URL）
+    x_match = re.search(r'(?:^|//)(?:www\.|mobile\.)?(?:x|twitter)\.com/([A-Za-z0-9_]+)/status', url)
+    if x_match and x_match.group(1).lower() != "i":  # /i/status/... は投稿者名が含まれない形式
+        return f"@{x_match.group(1)}"
+
     # descriptionから「@xxx さんがシェア」パターン
     desc_match = re.search(r'@([\w.]+)', description or '')
     if desc_match:
