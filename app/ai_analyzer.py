@@ -82,6 +82,15 @@ def _build_tool() -> dict:
                     "type": ["string", "null"],
                     "description": "価格（例: 『990円』）。読み取れなければnull",
                 },
+                "search_query": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "その商品の公式ページをWeb検索で見つけるための検索語（店名は含めない）。"
+                        "写真・値札・パッケージ・キャプションに品番/型番/JANコード/シリーズ名/正式な商品名が"
+                        "読み取れればそれを優先して使う（例: 『4549131xxxxxx』『ふた付き ランドリーバスケット 品番 123456』）。"
+                        "読み取れなければ商品の特徴が伝わる短い語句。分からなければnull"
+                    ),
+                },
                 "category": {"type": "string", "enum": CATEGORIES},
                 "post_account": {
                     "type": ["string", "null"],
@@ -101,6 +110,9 @@ SYSTEM_PROMPT = """あなたはSNS（Instagram・TikTokなど）の商品紹介�
 - 位置情報タグ、写真に写ったロゴ・値札・パッケージ・店内の様子
 - 「100均」だけでは店を決めつけず、ダイソー・セリア・キャンドゥを候補に並べて確信度を下げる
 
+また、値札・パッケージ・タグ・キャプションに書かれた「品番・型番・JANコード・正式な商品名」を丁寧に読み取り、
+公式サイトでその商品を検索できる search_query にまとめてください（読めない文字を推測で埋めないこと）。
+
 根拠がはっきりしない場合は無理に断定せず、確信度を低くしてください。
 必ず report_product ツールで回答してください。"""
 
@@ -117,6 +129,7 @@ def _fallback(caption: str, url: str) -> dict:
         "needs_confirmation": True,
         "product_name": extract_product_name(caption, caption, store),
         "price": None,
+        "search_query": None,
         "category": detect_category(caption),
         "post_account": extract_account(url, caption),
         "location_required": store in LOCATION_REQUIRED_STORES,
@@ -203,6 +216,7 @@ def analyze_post(
         "needs_confirmation": top.get("confidence", 0) < CONFIDENCE_THRESHOLD,
         "product_name": data.get("product_name") or f"{store_name}の紹介投稿",
         "price": data.get("price"),
+        "search_query": (data.get("search_query") or "").strip() or None,
         "category": data.get("category") or "生活雑貨",
         "post_account": post_account,
         "location_required": store_name in LOCATION_REQUIRED_STORES,
